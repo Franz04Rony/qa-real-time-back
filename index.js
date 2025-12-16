@@ -43,12 +43,12 @@ console.log(`Loaded ${ALL_QUESTIONS.length} questions and ${ALL_PUNISHMENTS.leng
 // Global Game State (Single Room 'default' for simplicity as per requirements for 2 people)
 let gameState = {
     players: {}, // { socketId: { id, name, score, avatar? } }
-    status: 'LOBBY', // LOBBY, QUESTION, VOTING, PUNISHMENT, RESULTS
     round: 0,
-    maxRounds: 10,
+    maxRounds: 6,
     currentQuestion: "",
     currentQuestionIndex: -1,
     currentPunishment: "",
+    currentPunishmentIndex: 0,
     answers: {}, // { socketId: text }
     votes: {}, // { socketId: boolean } (true = correct, false = incorrect)
     ready: {}, // { socketId: boolean }
@@ -170,9 +170,16 @@ function evaluatePunishmentOrNext() {
         gameState.status = 'PUNISHMENT';
 
         // Pick random from game subset (or sequential if we want unique punishments per game)
-        // Let's pick random from the subset to keep it unpredictable but from the selected pool
-        const pIndex = Math.floor(Math.random() * gameState.gamePunishments.length);
-        gameState.currentPunishment = gameState.gamePunishments[pIndex];
+        // Use sequential index to ensure unique punishments from the subset
+        const pIndex = gameState.currentPunishmentIndex;
+        if (pIndex < gameState.gamePunishments.length) {
+            gameState.currentPunishment = gameState.gamePunishments[pIndex];
+            gameState.currentPunishmentIndex++;
+        } else {
+            // Fallback if we run out (shouldn't happen if subset size >= maxRounds)
+            const randomFallback = Math.floor(Math.random() * gameState.gamePunishments.length);
+            gameState.currentPunishment = gameState.gamePunishments[randomFallback];
+        }
 
         gameState.punishmentDone = [];
         broadcastState();
@@ -203,10 +210,11 @@ io.on('connection', (socket) => {
             gameState.round = 0;
             gameState.players[Object.keys(gameState.players)[0]].score = 0;
             gameState.players[Object.keys(gameState.players)[1]].score = 0;
+            gameState.currentPunishmentIndex = 0;
 
             // initialize game session subsets
-            gameState.gameQuestions = getRandomSubset(ALL_QUESTIONS, 10);
-            gameState.gamePunishments = getRandomSubset(ALL_PUNISHMENTS, 10);
+            gameState.gameQuestions = getRandomSubset(ALL_QUESTIONS, gameState.maxRounds);
+            gameState.gamePunishments = getRandomSubset(ALL_PUNISHMENTS, gameState.maxRounds);
 
             nextRound();
         }
