@@ -18,7 +18,10 @@ const io = new Server(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    // Keep connections alive through proxies (Render, load balancers)
+    pingInterval: 10000,
+    pingTimeout: 60000
 });
 
 // Load Data
@@ -42,9 +45,10 @@ console.log(`Loaded ${ALL_QUESTIONS.length} questions and ${ALL_PUNISHMENTS.leng
 
 // Global Game State (Single Room 'default' for simplicity as per requirements for 2 people)
 let gameState = {
+    status: 'LOBBY',
     players: {}, // { socketId: { id, name, score, avatar? } }
     round: 0,
-    maxRounds: 6,
+    maxRounds: 10,
     currentQuestion: "",
     currentQuestionIndex: -1,
     currentPunishment: "",
@@ -58,15 +62,58 @@ let gameState = {
     timerInterval: null
 };
 
+app.get('/health', (req, res) => {
+    res.json({
+        ok: true,
+        uptime: process.uptime(),
+        connectedClients: io.engine.clientsCount,
+        gameStatus: gameState.status
+    });
+});
+
 // Utils
-function getRandomSubset(array, count) {
-    const shuffled = [...array].sort(() => 0.5 - Math.random());
-    return shuffled.slice(0, count);
+function getPlayerCount() {
+    return Object.keys(gameState.players).length;
 }
 
-function broadcastState() {
+function updateLobbyStatus() {
+    const count = getPlayerCount();
+    if (count === 0) {
+        gameState.status = 'LOBBY';
+    } else if (count === 1) {
+        gameState.status = 'WAITING';
+    } else if (count === 2 && ['LOBBY', 'WAITING', 'READY'].includes(gameState.status)) {
+        gameState.status = 'READY';
+    }
+}
 
-    io.emit('game_state', {
+function resetLobbyFields() {
+    gameState.round = 0;
+    gameState.currentQuestion = "";
+    gameState.currentQuestionIndex = -1;
+    gameState.currentPunishment = "";
+    gameState.currentPunishmentIndex = 0;
+    gameState.answers = {};
+    gameState.votes = {};
+    gameState.ready = {};
+    gameState.punishmentLosers = [];
+    gameState.punishmentDone = [];
+    clearInterval(gameState.timerInterval);
+    gameState.timerInterval = null;
+    gameState.timer = 0;
+}
+
+function getLobbyMessage() {
+    const count = getPlayerCount();
+    if (count === 0) return 'Esperando jugadores...';
+    if (count === 1) return 'Esperando al segundo jugador...';
+    if (gameState.status === 'READY') return '¡Listos! Cualquiera puede iniciar la partida.';
+    return '';
+}
+
+function getPublicState() {
+    const playerCount = getPlayerCount();
+    return {
         players: gameState.players,
         status: gameState.status,
         round: gameState.round,
@@ -74,9 +121,25 @@ function broadcastState() {
         currentQuestion: gameState.currentQuestion,
         currentPunishment: gameState.currentPunishment,
         answers: gameState.answers,
-        votes: gameState.votes, // Be careful sharing this before reveal? Actually requirement says "show answers" then vote.
-        punishmentLosers: gameState.punishmentLosers
-    });
+        votes: gameState.votes,
+        punishmentLosers: gameState.punishmentLosers,
+        playerCount,
+        canStart: playerCount === 2 && ['LOBBY', 'WAITING', 'READY'].includes(gameState.status),
+        lobbyMessage: getLobbyMessage()
+    };
+}
+
+function broadcastState() {
+    io.emit('game_state', getPublicState());
+}
+
+function sendStateTo(socket) {
+    socket.emit('game_state', getPublicState());
+}
+
+function getRandomSubset(array, count) {
+    const shuffled = [...array].sort(() => 0.5 - Math.random());
+    return shuffled.slice(0, count);
 }
 
 function startTimer(seconds, callback) {
@@ -192,32 +255,56 @@ function evaluatePunishmentOrNext() {
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
+    // Sync current state immediately so the client knows what's happening
+    sendStateTo(socket);
+    socket.emit('connection_ack', {
+        socketId: socket.id,
+        keepAliveIntervalMs: 25000,
+        message: 'Conectado al servidor. Ingresa tu nickname para unirte.'
+    });
+
+    socket.on('ping', () => {
+        socket.emit('pong', { ts: Date.now() });
+    });
+
     socket.on('join_game', (nickname) => {
-        if (Object.keys(gameState.players).length >= 2) {
+        if (getPlayerCount() >= 2) {
             socket.emit('error', 'Game full');
+            return;
+        }
+        if (!nickname || !String(nickname).trim()) {
+            socket.emit('error', 'Nickname requerido');
             return;
         }
         gameState.players[socket.id] = {
             id: socket.id,
-            name: nickname,
+            name: String(nickname).trim(),
             score: 0
         };
+        updateLobbyStatus();
         broadcastState();
     });
 
     socket.on('start_game', () => {
-        if (Object.keys(gameState.players).length === 2) {
-            gameState.round = 0;
-            gameState.players[Object.keys(gameState.players)[0]].score = 0;
-            gameState.players[Object.keys(gameState.players)[1]].score = 0;
-            gameState.currentPunishmentIndex = 0;
-
-            // initialize game session subsets
-            gameState.gameQuestions = getRandomSubset(ALL_QUESTIONS, gameState.maxRounds);
-            gameState.gamePunishments = getRandomSubset(ALL_PUNISHMENTS, gameState.maxRounds);
-
-            nextRound();
+        if (getPlayerCount() !== 2) {
+            socket.emit('error', 'Esperando al segundo jugador');
+            return;
         }
+        if (!['LOBBY', 'WAITING', 'READY'].includes(gameState.status)) {
+            socket.emit('error', 'La partida ya está en curso');
+            return;
+        }
+
+        gameState.round = 0;
+        gameState.players[Object.keys(gameState.players)[0]].score = 0;
+        gameState.players[Object.keys(gameState.players)[1]].score = 0;
+        gameState.currentPunishmentIndex = 0;
+
+        // initialize game session subsets
+        gameState.gameQuestions = getRandomSubset(ALL_QUESTIONS, gameState.maxRounds);
+        gameState.gamePunishments = getRandomSubset(ALL_PUNISHMENTS, gameState.maxRounds);
+
+        nextRound();
     });
 
     socket.on('submit_answer', (text) => {
@@ -256,9 +343,9 @@ io.on('connection', (socket) => {
     });
 
     socket.on('restart_game', () => {
+        resetLobbyFields();
+        gameState.players = {};
         gameState.status = 'LOBBY';
-        gameState.players = {}; // Or keep players and reset scores? Requirement: "vuelve a la página para ingresar el nickname" -> Reset all.
-        gameState.round = 0;
         broadcastState();
     });
 
@@ -266,17 +353,40 @@ io.on('connection', (socket) => {
         console.log('User disconnected:', socket.id);
         delete gameState.players[socket.id];
         // If playing, reset or pause? For simplicity, reset to lobby
-        if (gameState.status !== 'LOBBY' && gameState.status !== 'RESULTS') {
+        if (gameState.status !== 'LOBBY' && gameState.status !== 'WAITING' && gameState.status !== 'READY' && gameState.status !== 'RESULTS') {
+            resetLobbyFields();
             gameState.status = 'LOBBY';
-            gameState.players = {}; // Force reset
+            gameState.players = {};
             io.emit('game_reset', 'Player disconnected');
+        } else {
+            updateLobbyStatus();
         }
         broadcastState();
     });
 });
 
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3002;
+
+// Prevent Render free tier from spinning down due to inactivity (~15 min idle)
+const KEEP_ALIVE_MS = 10 * 60 * 1000;
+const keepAliveTimer = setInterval(() => {
+    http.get(`http://127.0.0.1:${PORT}/health`, () => {}).on('error', () => {});
+}, KEEP_ALIVE_MS);
+keepAliveTimer.unref();
+
+function shutdown() {
+    console.log('Shutting down gracefully...');
+    clearInterval(gameState.timerInterval);
+    clearInterval(keepAliveTimer);
+    io.emit('game_reset', 'Server restarting');
+    io.close();
+    server.close(() => process.exit(0));
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
 server.listen(PORT, () => {
     console.log(`SERVER RUNNING ON PORT ${PORT}`);
 });
