@@ -77,14 +77,10 @@ function getPlayerCount() {
 }
 
 function updateLobbyStatus() {
-    const count = getPlayerCount();
-    if (count === 0) {
-        gameState.status = 'LOBBY';
-    } else if (count === 1) {
-        gameState.status = 'WAITING';
-    } else if (count === 2 && ['LOBBY', 'WAITING', 'READY'].includes(gameState.status)) {
-        gameState.status = 'READY';
+    if (['QUESTION', 'VOTING', 'PUNISHMENT', 'RESULTS'].includes(gameState.status)) {
+        return;
     }
+    gameState.status = 'LOBBY';
 }
 
 function resetLobbyFields() {
@@ -107,7 +103,7 @@ function getLobbyMessage() {
     const count = getPlayerCount();
     if (count === 0) return 'Esperando jugadores...';
     if (count === 1) return 'Esperando al segundo jugador...';
-    if (gameState.status === 'READY') return '¡Listos! Cualquiera puede iniciar la partida.';
+    if (count === 2) return '¡Listos! Cualquiera puede iniciar la partida.';
     return '';
 }
 
@@ -124,7 +120,7 @@ function getPublicState() {
         votes: gameState.votes,
         punishmentLosers: gameState.punishmentLosers,
         playerCount,
-        canStart: playerCount === 2 && ['LOBBY', 'WAITING', 'READY'].includes(gameState.status),
+        canStart: playerCount === 2 && gameState.status === 'LOBBY',
         lobbyMessage: getLobbyMessage()
     };
 }
@@ -290,7 +286,7 @@ io.on('connection', (socket) => {
             socket.emit('error', 'Esperando al segundo jugador');
             return;
         }
-        if (!['LOBBY', 'WAITING', 'READY'].includes(gameState.status)) {
+        if (gameState.status !== 'LOBBY') {
             socket.emit('error', 'La partida ya está en curso');
             return;
         }
@@ -353,7 +349,7 @@ io.on('connection', (socket) => {
         console.log('User disconnected:', socket.id);
         delete gameState.players[socket.id];
         // If playing, reset or pause? For simplicity, reset to lobby
-        if (gameState.status !== 'LOBBY' && gameState.status !== 'WAITING' && gameState.status !== 'READY' && gameState.status !== 'RESULTS') {
+        if (gameState.status !== 'LOBBY' && gameState.status !== 'RESULTS') {
             resetLobbyFields();
             gameState.status = 'LOBBY';
             gameState.players = {};
