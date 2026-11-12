@@ -46,21 +46,33 @@ console.log(`Loaded ${ALL_QUESTIONS.length} questions and ${ALL_PUNISHMENTS.leng
 // Global Game State (Single Room 'default' for simplicity as per requirements for 2 people)
 let gameState = {
     status: 'LOBBY',
-    players: {}, // { socketId: { id, name, score, avatar? } }
+    players: {}, // { playerId: { id, name, score, connected } }
     round: 0,
     maxRounds: 10,
     currentQuestion: "",
     currentQuestionIndex: -1,
     currentPunishment: "",
     currentPunishmentIndex: 0,
-    answers: {}, // { socketId: text }
-    votes: {}, // { socketId: boolean } (true = correct, false = incorrect)
-    ready: {}, // { socketId: boolean }
-    punishmentLosers: [], // List of socketIds who lost the round
-    punishmentDone: [], // List of socketIds who finished punishment
+    answers: {}, // { playerId: text }
+    votes: {}, // { playerId: boolean } (true = correct, false = incorrect)
+    ready: {}, // { playerId: boolean }
+    punishmentLosers: [], // List of playerIds who lost the round
+    punishmentDone: [], // List of playerIds who finished punishment
     timer: 0,
     timerInterval: null
 };
+
+// How long a disconnected player keeps their seat before being removed
+const RECONNECT_GRACE_MS = 60 * 1000;
+const activeSockets = {}; // { playerId: socketId } - latest socket for each player
+const disconnectTimers = {}; // { playerId: Timeout }
+
+function clearDisconnectTimers() {
+    Object.keys(disconnectTimers).forEach(id => {
+        clearTimeout(disconnectTimers[id]);
+        delete disconnectTimers[id];
+    });
+}
 
 app.get('/health', (req, res) => {
     res.json({
@@ -99,6 +111,10 @@ function resetLobbyFields() {
     gameState.timer = 0;
 }
 
+function allPlayersConnected() {
+    return Object.values(gameState.players).every(p => p.connected);
+}
+
 function getLobbyMessage() {
     const count = getPlayerCount();
     if (count === 0) return 'Esperando jugadores...';
@@ -119,8 +135,10 @@ function getPublicState() {
         answers: gameState.answers,
         votes: gameState.votes,
         punishmentLosers: gameState.punishmentLosers,
+        punishmentDone: gameState.punishmentDone,
+        timer: gameState.timer,
         playerCount,
-        canStart: playerCount === 2 && gameState.status === 'LOBBY',
+        canStart: playerCount === 2 && allPlayersConnected() && gameState.status === 'LOBBY',
         lobbyMessage: getLobbyMessage()
     };
 }
@@ -249,10 +267,24 @@ function evaluatePunishmentOrNext() {
 }
 
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+    const rawPlayerId = socket.handshake.auth && socket.handshake.auth.playerId;
+    const playerId = typeof rawPlayerId === 'string' && rawPlayerId.length > 0 && rawPlayerId.length <= 64
+        ? rawPlayerId
+        : socket.id;
+    console.log('User connected:', socket.id, 'player:', playerId);
 
-    // Sync current state immediately so the client knows what's happening
-    sendStateTo(socket);
+    activeSockets[playerId] = socket.id;
+    const returningPlayer = gameState.players[playerId];
+    if (returningPlayer) {
+        clearTimeout(disconnectTimers[playerId]);
+        delete disconnectTimers[playerId];
+        returningPlayer.connected = true;
+        console.log('Player reconnected:', returningPlayer.name);
+        broadcastState();
+    } else {
+        // Sync current state immediately so the client knows what's happening
+        sendStateTo(socket);
+    }
     socket.emit('connection_ack', {
         socketId: socket.id,
         keepAliveIntervalMs: 25000,
@@ -264,6 +296,10 @@ io.on('connection', (socket) => {
     });
 
     socket.on('join_game', (nickname) => {
+        if (gameState.players[playerId]) {
+            sendStateTo(socket);
+            return;
+        }
         if (getPlayerCount() >= 2) {
             socket.emit('error', 'Game full');
             return;
@@ -272,10 +308,11 @@ io.on('connection', (socket) => {
             socket.emit('error', 'Nickname requerido');
             return;
         }
-        gameState.players[socket.id] = {
-            id: socket.id,
+        gameState.players[playerId] = {
+            id: playerId,
             name: String(nickname).trim(),
-            score: 0
+            score: 0,
+            connected: true
         };
         updateLobbyStatus();
         broadcastState();
@@ -288,6 +325,10 @@ io.on('connection', (socket) => {
         }
         if (gameState.status !== 'LOBBY') {
             socket.emit('error', 'La partida ya está en curso');
+            return;
+        }
+        if (!allPlayersConnected()) {
+            socket.emit('error', 'Esperando a que el otro jugador se reconecte');
             return;
         }
 
@@ -304,8 +345,8 @@ io.on('connection', (socket) => {
     });
 
     socket.on('submit_answer', (text) => {
-        if (gameState.status !== 'QUESTION') return;
-        gameState.answers[socket.id] = text;
+        if (gameState.status !== 'QUESTION' || !gameState.players[playerId]) return;
+        gameState.answers[playerId] = text;
 
         // If both answered, stop timer and go to voting
         if (Object.keys(gameState.answers).length === 2) {
@@ -317,47 +358,82 @@ io.on('connection', (socket) => {
     });
 
     socket.on('vote_answer', (isCorrect) => {
-        if (gameState.status !== 'VOTING') return;
-        gameState.votes[socket.id] = isCorrect;
+        if (gameState.status !== 'VOTING' || !gameState.players[playerId]) return;
+        gameState.votes[playerId] = isCorrect;
 
         if (Object.keys(gameState.votes).length === 2) {
             evaluatePunishmentOrNext();
+        } else {
+            broadcastState();
         }
     });
 
     socket.on('punishment_done', () => {
-        if (gameState.status !== 'PUNISHMENT') return;
-        if (!gameState.punishmentDone.includes(socket.id)) {
-            gameState.punishmentDone.push(socket.id);
+        if (gameState.status !== 'PUNISHMENT' || !gameState.players[playerId]) return;
+        if (!gameState.punishmentDone.includes(playerId)) {
+            gameState.punishmentDone.push(playerId);
         }
 
         // Verify if all losers are done
         const allDone = gameState.punishmentLosers.every(id => gameState.punishmentDone.includes(id));
         if (allDone) {
             nextRound();
+        } else {
+            broadcastState();
         }
+    });
+
+    socket.on('back_to_lobby', () => {
+        const player = gameState.players[playerId];
+        if (!player || gameState.status === 'LOBBY') return;
+
+        resetLobbyFields();
+        Object.values(gameState.players).forEach(p => { p.score = 0; });
+        gameState.status = 'LOBBY';
+        socket.broadcast.emit('notice', `${player.name} volvió al lobby`);
+        broadcastState();
     });
 
     socket.on('restart_game', () => {
         resetLobbyFields();
+        clearDisconnectTimers();
         gameState.players = {};
         gameState.status = 'LOBBY';
         broadcastState();
     });
 
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        delete gameState.players[socket.id];
-        // If playing, reset or pause? For simplicity, reset to lobby
-        if (gameState.status !== 'LOBBY' && gameState.status !== 'RESULTS') {
-            resetLobbyFields();
-            gameState.status = 'LOBBY';
-            gameState.players = {};
-            io.emit('game_reset', 'Player disconnected');
-        } else {
-            updateLobbyStatus();
-        }
+        console.log('User disconnected:', socket.id, 'player:', playerId);
+        // A newer socket (e.g. after a reload) already took over this player
+        if (activeSockets[playerId] !== socket.id) return;
+        delete activeSockets[playerId];
+
+        const player = gameState.players[playerId];
+        if (!player) return;
+
+        player.connected = false;
         broadcastState();
+
+        clearTimeout(disconnectTimers[playerId]);
+        disconnectTimers[playerId] = setTimeout(() => {
+            delete disconnectTimers[playerId];
+            const stillGone = gameState.players[playerId] && !gameState.players[playerId].connected;
+            // Keep both players on the final results screen
+            if (!stillGone || gameState.status === 'RESULTS') return;
+
+            console.log('Player did not reconnect in time:', gameState.players[playerId].name);
+            delete gameState.players[playerId];
+            if (gameState.status !== 'LOBBY') {
+                resetLobbyFields();
+                clearDisconnectTimers();
+                gameState.status = 'LOBBY';
+                gameState.players = {};
+                io.emit('game_reset', 'El otro jugador se desconectó');
+            } else {
+                updateLobbyStatus();
+            }
+            broadcastState();
+        }, RECONNECT_GRACE_MS);
     });
 });
 
